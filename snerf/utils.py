@@ -39,10 +39,6 @@ class Trainer(_Trainer):
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
         time = data['time'] # [B, 1]
-        print(data)
-        print(rays_o.shape)
-        print(rays_d.shape)
-        print(time.shape)
 
         # if there is no gt image, we train with CLIP loss.
         if 'images' not in data:

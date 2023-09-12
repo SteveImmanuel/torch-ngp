@@ -5,7 +5,7 @@ import json
 import tqdm
 import numpy as np
 from scipy.spatial.transform import Slerp, Rotation
-
+from collections import defaultdict
 import trimesh
 
 import torch
@@ -203,10 +203,11 @@ class NeRFDataset:
             
             self.poses = []
             self.images = []
+            self.image_groups = defaultdict(list)
             self.times = []
 
             # assume frames are already sorted by time!
-            for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
+            for idx, f in enumerate(tqdm.tqdm(frames, desc=f'Loading {type} data')):
                 f_path = os.path.join(self.root_path, f['file_path'])
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
                     f_path += '.png' # so silly...
@@ -243,10 +244,12 @@ class NeRFDataset:
                 self.poses.append(pose)
                 self.images.append(image)
                 self.times.append(time)
+                self.image_groups[str(time)].append(idx)
             
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
+        self.raw_times = self.times[:]
         self.times = torch.from_numpy(np.asarray(self.times, dtype=np.float32)).view(-1, 1) # [N, 1]
 
         # manual normalize
@@ -337,12 +340,20 @@ class NeRFDataset:
             'rays_d': rays['rays_d'],
         }
         if self.images is not None:
-            print(self.images[index].shape)
+            time_key = str(self.raw_times[index[0]])
+            multi_images_idx = self.image_groups[time_key]
+            multi_poses = self.poses[multi_images_idx]
+            multi_images = self.images[multi_images_idx] # TODO: try randomize the order?
             images = self.images[index].to(self.device) # [B, H, W, 3/4]
+            C = images.shape[-1]
             if self.training:
-                C = images.shape[-1]
                 images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
+            if C == 4:
+                # remove alpha channel and set rbg to 0 when alpha is 0
+                multi_images = multi_images[..., :3] * multi_images[..., 3:] + (1 - multi_images[..., 3:]) * torch.zeros_like(multi_images[..., :3])
             results['images'] = images
+            results['multi_images'] = multi_images
+            results['multi_poses'] = multi_poses
         
         # need inds to update error_map
         if error_map is not None:
