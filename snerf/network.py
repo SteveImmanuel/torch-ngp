@@ -1,10 +1,49 @@
 import torch
+import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torchvision.models import EfficientNet_B2_Weights, efficientnet_b2
 from encoding import get_encoder
 from activation import trunc_exp
 from .renderer import NeRFRenderer
+
+class MultiViewEncoder(nn.Module):
+    def __init__(self, vision_final_dim=500, final_dim=256) -> None:
+        super().__init__()
+        weights = EfficientNet_B2_Weights.IMAGENET1K_V1
+        self.vision_preprocess = weights.transforms(antialias=True)
+        self.vision_model = efficientnet_b2(weights=weights)
+        self.vision_model.classifier = nn.Identity()
+        
+        self.vision_mlp = nn.Linear(1408, vision_final_dim)
+        self.mlp1 = nn.Sequential(
+            nn.Linear(vision_final_dim + 12, 256), # TODO: modify this, add dropout, activation, etc.
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Linear(256, 256),
+        )
+        self.tanh = nn.Tanh()
+
+    def forward(self, multi_images, multi_poses):
+        # multi_images [B, 3, H, W] 
+        # multi_poses [B, 3, 4]
+        # where B is always the number of multi-views
+        B = multi_images.shape[0]
+        multi_poses = multi_poses.view(B, -1) # [B, 12]
+
+        preprocessed_img = self.vision_preprocess(multi_images)
+        img_features = self.vision_model(preprocessed_img)
+        img_features = self.vision_mlp(img_features) # [B, vision_final_dim]
+
+        features = torch.cat([img_features, multi_poses], dim=1) # [B, vision_final_dim + 12]
+        features = self.mlp1(features)
+        
+        features = features.mean(dim=0, keepdim=True) # [1, 256]
+        features = self.mlp2(features)
+        features = self.tanh(features)
+
+        return features # [1, 256]
 
 
 class NeRFNetwork(NeRFRenderer):
@@ -268,3 +307,6 @@ class NeRFNetwork(NeRFRenderer):
             params.append({'params': self.bg_net.parameters(), 'lr': lr_net})
         
         return params
+
+if __name__ == '__main__':
+    multiview_enc = MultiViewEncoder()
