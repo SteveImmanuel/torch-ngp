@@ -342,7 +342,7 @@ class NeRFDataset:
         if self.images is not None:
             time_key = str(self.raw_times[index[0]])
             multi_images_idx = self.image_groups[time_key]
-            multi_poses = self.poses[multi_images_idx]
+            multi_poses = self.poses[multi_images_idx][:, :3, :] # remove the last row because it only contains [0, 0, 0, 1]
             multi_images = self.images[multi_images_idx] # TODO: try randomize the order?
             images = self.images[index].to(self.device) # [B, H, W, 3/4]
             C = images.shape[-1]
