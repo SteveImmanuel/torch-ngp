@@ -8,6 +8,23 @@ from encoding import get_encoder
 from activation import trunc_exp
 from .renderer import NeRFRenderer
 
+from transformers import CLIPImageProcessor, CLIPVisionModel
+
+class SemanticNetwork(nn.Module):
+    def __init__(self, model_name='openai/clip-vit-base-patch32') -> None:
+        super().__init__()
+        self.processor = CLIPImageProcessor.from_pretrained(model_name)
+        self.model = CLIPVisionModel.from_pretrained(model_name)
+        self.eval()
+
+    @torch.inference_mode()
+    def forward(self, images):
+        # images [B, 3, H, W]
+        inputs = self.processor(images=images, return_tensors="pt")
+        outputs = self.model(**inputs)
+        return outputs.pooler_output # [B, 768]
+
+
 class MultiViewEncoder(nn.Module):
     def __init__(self, vision_final_dim=500, final_dim=256) -> None:
         super().__init__()
@@ -18,10 +35,10 @@ class MultiViewEncoder(nn.Module):
         
         self.vision_mlp = nn.Linear(1408, vision_final_dim)
         self.mlp1 = nn.Sequential(
-            nn.Linear(vision_final_dim + 12, 256), # TODO: modify this, add dropout, activation, etc.
+            nn.Linear(vision_final_dim + 12, final_dim), # TODO: modify this, add dropout, activation, etc.
         )
         self.mlp2 = nn.Sequential(
-            nn.Linear(256, 256),
+            nn.Linear(final_dim, final_dim),
         )
         self.tanh = nn.Tanh()
 
@@ -39,11 +56,11 @@ class MultiViewEncoder(nn.Module):
         features = torch.cat([img_features, multi_poses], dim=1) # [B, vision_final_dim + 12]
         features = self.mlp1(features)
         
-        features = features.mean(dim=0, keepdim=True) # [1, 256]
+        features = features.mean(dim=0, keepdim=True) # [1, final_dim]
         features = self.mlp2(features)
         features = self.tanh(features)
 
-        return features # [1, 256]
+        return features # [1, final_dim]
 
 
 class NeRFNetwork(NeRFRenderer):
@@ -63,6 +80,7 @@ class NeRFNetwork(NeRFRenderer):
                  num_layers_deform=5, # a deeper MLP is very necessary for performance.
                  hidden_dim_deform=128,
                  bound=1,
+                 latent_vector_dim=256,
                  **kwargs,
                  ):
         super().__init__(bound, **kwargs)
@@ -72,12 +90,14 @@ class NeRFNetwork(NeRFRenderer):
         self.hidden_dim_deform = hidden_dim_deform
         self.encoder_deform, self.in_dim_deform = get_encoder(encoding_deform, multires=10)
         self.encoder_time, self.in_dim_time = get_encoder(encoding_time, input_dim=1, multires=6)
-
+        self.latent_vector_dim = latent_vector_dim
         
         deform_net = []
         for l in range(num_layers_deform):
             if l == 0:
-                in_dim = self.in_dim_deform + self.in_dim_time # grid dim + time
+                # in_dim = self.in_dim_deform + self.in_dim_time # grid dim + time
+                # in_dim = self.in_dim_deform + self.latent_vector_dim # grid dim + latent vector dim
+                in_dim = self.in_dim_deform + self.latent_vector_dim + self.in_dim_time # grid dim + latent vector dim + time
             else:
                 in_dim = hidden_dim_deform
             
@@ -100,7 +120,9 @@ class NeRFNetwork(NeRFRenderer):
         sigma_net = []
         for l in range(num_layers):
             if l == 0:
-                in_dim = self.in_dim + self.in_dim_time + self.in_dim_deform # concat everything
+                # in_dim = self.in_dim + self.in_dim_time + self.in_dim_deform # concat everything
+                # in_dim = self.in_dim + self.latent_vector_dim + self.in_dim_deform # concat everything
+                in_dim = self.in_dim + self.latent_vector_dim + self.in_dim_deform + self.in_dim_time # concat everything
             else:
                 in_dim = hidden_dim
             
@@ -158,11 +180,22 @@ class NeRFNetwork(NeRFRenderer):
         else:
             self.bg_net = None
 
+        # multi-view encoder
+        self.multiview_enc = MultiViewEncoder(final_dim=latent_vector_dim)
 
-    def forward(self, x, d, t):
+    def forward(self, x, d, t, multi_images, multi_poses):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
         # t: [1, 1], in [0, 1]
+        # multi_images [B, 3, H, W] 
+        # multi_poses [B, 3, 4]
+        # print(x.shape)
+        # print(d.shape)
+        # print(t.shape)
+        # print(multi_images.shape)
+        # print(multi_poses.shape)
+        latent_vector = self.multiview_enc(multi_images, multi_poses) # [1, final_dim]
+        latent_vector = latent_vector.repeat(x.shape[0], 1) # [1, final_dim] --> [N, final_dim]
 
         # deform
         enc_ori_x = self.encoder_deform(x, bound=self.bound) # [N, C]
@@ -170,17 +203,20 @@ class NeRFNetwork(NeRFRenderer):
         if enc_t.shape[0] == 1:
             enc_t = enc_t.repeat(x.shape[0], 1) # [1, C'] --> [N, C']
 
-        deform = torch.cat([enc_ori_x, enc_t], dim=1) # [N, C + C']
+        # deform = torch.cat([enc_ori_x, enc_t], dim=1) # [N, C + C']
+        # deform = torch.cat([enc_ori_x, latent_vector], dim=1) # [N, C + C']
+        deform = torch.cat([enc_ori_x, enc_t, latent_vector], dim=1) # [N, C + C' + latent_vector_dim]
         for l in range(self.num_layers_deform):
             deform = self.deform_net[l](deform)
             if l != self.num_layers_deform - 1:
                 deform = F.relu(deform, inplace=True)
-        
         x = x + deform
 
         # sigma
         x = self.encoder(x, bound=self.bound)
-        h = torch.cat([x, enc_ori_x, enc_t], dim=1)
+        # h = torch.cat([x, enc_ori_x, enc_t], dim=1)
+        # h = torch.cat([x, enc_ori_x, latent_vector], dim=1)
+        h = torch.cat([x, enc_ori_x, enc_t, latent_vector], dim=1)
         for l in range(self.num_layers):
             h = self.sigma_net[l](h)
             if l != self.num_layers - 1:
@@ -200,22 +236,28 @@ class NeRFNetwork(NeRFRenderer):
         
         # sigmoid activation for rgb
         rgbs = torch.sigmoid(h)
-
         return sigma, rgbs, deform
 
-    def density(self, x, t):
+    def latent_vector(self, multi_images, multi_poses):
+        # multi_images [B, 3, H, W] 
+        # multi_poses [B, 3, 4]
+        return self.multiview_enc(multi_images, multi_poses) # [1, final_dim]
+
+    def density(self, x, t, multi_images, multi_poses):
         # x: [N, 3], in [-bound, bound]
         # t: [1, 1], in [0, 1]
-
+        # multi_images [B, 3, H, W] 
+        # multi_poses [B, 3, 4]
         results = {}
-
+        latent_vector = self.multiview_enc(multi_images, multi_poses) # [1, final_dim]
+        latent_vector = latent_vector.repeat(x.shape[0], 1) # [1, final_dim] --> [N, final_dim]
         # deformation
         enc_ori_x = self.encoder_deform(x, bound=self.bound) # [N, C]
         enc_t = self.encoder_time(t) # [1, 1] --> [1, C']
         if enc_t.shape[0] == 1:
             enc_t = enc_t.repeat(x.shape[0], 1) # [1, C'] --> [N, C']
 
-        deform = torch.cat([enc_ori_x, enc_t], dim=1) # [N, C + C']
+        deform = torch.cat([enc_ori_x, enc_t, latent_vector], dim=1) # [N, C + C']
         for l in range(self.num_layers_deform):
             deform = self.deform_net[l](deform)
             if l != self.num_layers_deform - 1:
@@ -226,7 +268,7 @@ class NeRFNetwork(NeRFRenderer):
         
         # sigma
         x = self.encoder(x, bound=self.bound)
-        h = torch.cat([x, enc_ori_x, enc_t], dim=1)
+        h = torch.cat([x, enc_ori_x, enc_t, latent_vector], dim=1)
         for l in range(self.num_layers):
             h = self.sigma_net[l](h)
             if l != self.num_layers - 1:
@@ -301,6 +343,7 @@ class NeRFNetwork(NeRFRenderer):
             {'params': self.encoder_deform.parameters(), 'lr': lr},
             {'params': self.encoder_time.parameters(), 'lr': lr},
             {'params': self.deform_net.parameters(), 'lr': lr_net},
+            {'params': self.multiview_enc.parameters(), 'lr': lr},
         ]
         if self.bg_radius > 0:
             params.append({'params': self.encoder_bg.parameters(), 'lr': lr})
@@ -309,4 +352,13 @@ class NeRFNetwork(NeRFRenderer):
         return params
 
 if __name__ == '__main__':
-    multiview_enc = MultiViewEncoder()
+    nerf = NeRFNetwork()
+    nerf.to(0)
+    N = 100
+    x = torch.randn(N, 3).to(0)
+    d = torch.randn(N, 3).to(0)
+    t = torch.randn(1, 1).to(0)
+    multi_images = torch.randn(4, 3, 800, 800).to(0)
+    multi_poses = torch.randn(4, 3, 4).to(0)
+
+    res = nerf(x, d, t, multi_images, multi_poses)

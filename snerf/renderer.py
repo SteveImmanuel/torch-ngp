@@ -113,6 +113,9 @@ class NeRFRenderer(nn.Module):
 
     def color(self, x, d, t, mask=None, **kwargs):
         raise NotImplementedError()
+    
+    def latent_vector(self, multi_images, multi_poses):
+        raise NotImplementedError()
 
     def reset_extra_state(self):
         if not self.cuda_ray:
@@ -258,7 +261,7 @@ class NeRFRenderer(nn.Module):
         }
 
 
-    def run_cuda(self, rays_o, rays_d, time, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, **kwargs):
+    def run_cuda(self, rays_o, rays_d, time, multi_images, multi_poses, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # time: [B, 1], B == 1, so only one time is used.
         # return: image: [B, N, 3], depth: [B, N]
@@ -293,10 +296,9 @@ class NeRFRenderer(nn.Module):
             self.local_step += 1
 
             xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, self.bound, self.density_bitfield[t], self.cascade, self.grid_size, nears, fars, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps)
-
             #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
             
-            sigmas, rgbs, deform = self(xyzs, dirs, time)
+            sigmas, rgbs, deform = self(xyzs, dirs, time, multi_images, multi_poses)
             # density_outputs = self.density(xyzs, time) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
             # sigmas = density_outputs['sigma']
             # rgbs = self.color(xyzs, dirs, **density_outputs)
@@ -361,7 +363,7 @@ class NeRFRenderer(nn.Module):
 
                 xyzs, dirs, deltas = raymarching.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, self.bound, self.density_bitfield[t], self.cascade, self.grid_size, nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps)
 
-                sigmas, rgbs, _ = self(xyzs, dirs, time)
+                sigmas, rgbs, _ = self(xyzs, dirs, time, multi_images, multi_poses)
                 # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
                 # sigmas = density_outputs['sigma']
                 # rgbs = self.color(xyzs, dirs, **density_outputs)
@@ -451,7 +453,7 @@ class NeRFRenderer(nn.Module):
         print(f'[mark untrained grid] {(count == 0).sum()} from {self.grid_size ** 3 * self.cascade}')
 
     @torch.no_grad()
-    def update_extra_state(self, decay=0.95, S=128):
+    def update_extra_state(self, multi_images, multi_poses, decay=0.95, S=128):
         # call before each epoch to update extra states.
 
         if not self.cuda_ray:
@@ -491,7 +493,7 @@ class NeRFRenderer(nn.Module):
                                 # add noise in time [-hts, hts]
                                 time_perturb = time + (torch.rand_like(time) * 2 - 1) * half_time_size
                                 # query density
-                                sigmas = self.density(cas_xyzs, time_perturb)['sigma'].reshape(-1).detach()
+                                sigmas = self.density(cas_xyzs, time_perturb, multi_images, multi_poses)['sigma'].reshape(-1).detach()
                                 sigmas *= self.density_scale
                                 # assign 
                                 tmp_grid[t, cas, indices] = sigmas
@@ -525,7 +527,7 @@ class NeRFRenderer(nn.Module):
                     # add noise in time [-hts, hts]
                     time_perturb = time + (torch.rand_like(time) * 2 - 1) * half_time_size
                     # query density
-                    sigmas = self.density(cas_xyzs, time_perturb)['sigma'].reshape(-1).detach()
+                    sigmas = self.density(cas_xyzs, time_perturb, multi_images, multi_poses)['sigma'].reshape(-1).detach()
                     sigmas *= self.density_scale
                     # assign 
                     tmp_grid[t, cas, indices] = sigmas
@@ -555,7 +557,7 @@ class NeRFRenderer(nn.Module):
         #print(f'[density grid] min={self.density_grid.min().item():.4f}, max={self.density_grid.max().item():.4f}, mean={self.mean_density:.4f}, occ_rate={(self.density_grid > 0.01).sum() / (128**3 * self.cascade):.3f} | [step counter] mean={self.mean_count}')
 
 
-    def render(self, rays_o, rays_d, time, staged=False, max_ray_batch=4096, **kwargs):
+    def render(self, rays_o, rays_d, time, multi_images, multi_poses, staged=False, max_ray_batch=4096, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: pred_rgb: [B, N, 3]
 
@@ -576,7 +578,7 @@ class NeRFRenderer(nn.Module):
                 head = 0
                 while head < N:
                     tail = min(head + max_ray_batch, N)
-                    results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], time[b:b+1], **kwargs)
+                    results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], time[b:b+1], multi_images, multi_poses, **kwargs)
                     depth[b:b+1, head:tail] = results_['depth']
                     image[b:b+1, head:tail] = results_['image']
                     head += max_ray_batch
@@ -586,6 +588,6 @@ class NeRFRenderer(nn.Module):
             results['image'] = image
 
         else:
-            results = _run(rays_o, rays_d, time, **kwargs)
+            results = _run(rays_o, rays_d, time, multi_images, multi_poses, **kwargs)
 
         return results
