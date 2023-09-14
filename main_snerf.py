@@ -127,32 +127,38 @@ if __name__ == '__main__':
     else:
 
         optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr, opt.lr_net), betas=(0.9, 0.99), eps=1e-15)
+        dataset = NeRFDataset(opt, device=device, type='train')
+        train_loader = dataset.dataloader()
+        # for data in train_loader:
+        #     print(data)
+        #     break
 
-        train_loader = NeRFDataset(opt, device=device, type='train').dataloader()
-        for data in train_loader:
-            print(data)
-            break
-        # # decay to 0.1 * init_lr at last iter step
-        # scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
+        # decay to 0.1 * init_lr at last iter step
+        scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
+        multiview_info = {
+            'raw_times': dataset.raw_times,
+            'image_groups': dataset.image_groups,
+            'images': dataset.images,
+            'poses': dataset.poses,
+        }
+        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=[PSNRMeter()], use_checkpoint=opt.ckpt, eval_interval=50, multiview_info=multiview_info)
 
-        # trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=[PSNRMeter()], use_checkpoint=opt.ckpt, eval_interval=50)
-
-        # if opt.gui:
-        #     gui = NeRFGUI(opt, trainer, train_loader)
-        #     gui.render()
+        if opt.gui:
+            gui = NeRFGUI(opt, trainer, train_loader)
+            gui.render()
         
-        # else:
-        #     valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1).dataloader()
+        else:
+            valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1).dataloader()
 
-        #     max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
-        #     trainer.train(train_loader, valid_loader, max_epoch)
+            max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
+            trainer.train(train_loader, valid_loader, max_epoch)
 
-        #     # also test
-        #     test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+            # also test
+            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
             
-        #     if test_loader.has_gt:
-        #         trainer.evaluate(test_loader) # blender has gt, so evaluate it.
+            if test_loader.has_gt:
+                trainer.evaluate(test_loader) # blender has gt, so evaluate it.
             
-        #     trainer.test(test_loader, write_video=True) # test and save video
+            trainer.test(test_loader, write_video=True) # test and save video
             
-        #     #trainer.save_mesh(resolution=256, threshold=10)
+            #trainer.save_mesh(resolution=256, threshold=10)
