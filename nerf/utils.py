@@ -739,7 +739,10 @@ class Trainer(object):
             # update grid every 16 steps
             if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    self.model.update_extra_state()
+                    if 'multi_images' in data:
+                        self.model.update_extra_state(data['multi_images'], data['multi_poses'])
+                    else:
+                        self.model.update_extra_state()
             
             self.global_step += 1
 
@@ -853,7 +856,10 @@ class Trainer(object):
             # update grid every 16 steps
             if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    self.model.update_extra_state()
+                    if 'multi_images' in data:
+                        self.model.update_extra_state(data['multi_images'], data['multi_poses'])
+                    else:
+                        self.model.update_extra_state()
                     
             self.local_step += 1
             self.global_step += 1

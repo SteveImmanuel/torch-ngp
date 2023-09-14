@@ -7,6 +7,7 @@ class Trainer(_Trainer):
                  name, # name of this experiment
                  opt, # extra conf
                  model, # network 
+                 multiview_info, # multi-view info including raw_times, image_groups, images, poses to necessitate test_step
                  criterion=None, # loss function, if None, assume inline implementation in train_step
                  optimizer=None, # optimizer
                  ema_decay=None, # if use EMA, set the decay
@@ -30,15 +31,31 @@ class Trainer(_Trainer):
 
         self.optimizer_fn = optimizer
         self.lr_scheduler_fn = lr_scheduler
-
+        self.multiview_info = multiview_info
+        self.time_key_dict = {}
         super().__init__(name, opt, model, criterion, optimizer, ema_decay, lr_scheduler, metrics, local_rank, world_size, device, mute, fp16, eval_interval, max_keep_ckpt, workspace, best_mode, use_loss_as_metric, report_metric_at_train, use_checkpoint, use_tensorboardX, scheduler_update_every_step)
-        
+
+    def get_time_key(self, time):
+        key = str(time)
+        if key not in self.time_key_dict:
+            min_delta = float('inf')
+            final_key = ''
+            for i in range(len(self.multiview_info['raw_times'])):
+                cur_delta = abs(self.multiview_info['raw_times'][i] - time)
+                if cur_delta < min_delta:
+                    min_delta = cur_delta
+                    final_key = str(self.multiview_info['raw_times'][i])
+            self.time_key_dict[key] = final_key
+        return self.time_key_dict[key]
+
     ### ------------------------------	
 
     def train_step(self, data):
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
-        time = data['time'] # [B, 1]
+        time = data['time'] # [B, 1] B is always 1
+        multi_images = data['multi_images'] # [Num of Multiview, 3, H, W]
+        multi_poses = data['multi_poses'] # [Num of Multiview, 3, 4]
 
         # if there is no gt image, we train with CLIP loss.
         if 'images' not in data:
@@ -77,7 +94,7 @@ class Trainer(_Trainer):
         else:
             gt_rgb = images
 
-        outputs = self.model.render(rays_o, rays_d, time, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, time, multi_images, multi_poses, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False, **vars(self.opt))
     
         pred_rgb = outputs['image']
 
@@ -120,11 +137,12 @@ class Trainer(_Trainer):
         return pred_rgb, gt_rgb, loss
 
     def eval_step(self, data):
-
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
         time = data['time'] # [B, 1]
         images = data['images'] # [B, H, W, 3/4]
+        multi_images = data['multi_images'] # [Num of Multiview, 3, H, W]
+        multi_poses = data['multi_poses'] # [Num of Multiview, 3, 4]
         B, H, W, C = images.shape
 
         if self.opt.color_space == 'linear':
@@ -137,7 +155,7 @@ class Trainer(_Trainer):
         else:
             gt_rgb = images
         
-        outputs = self.model.render(rays_o, rays_d, time, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, time, multi_images, multi_poses, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
@@ -148,16 +166,17 @@ class Trainer(_Trainer):
 
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):  
-
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
         time = data['time'] # [B, 1]
+        multi_images = data['multi_images'] # [Num of Multiview, 3, H, W]
+        multi_poses = data['multi_poses'] # [Num of Multiview, 3, 4]
         H, W = data['H'], data['W']
 
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
 
-        outputs = self.model.render(rays_o, rays_d, time, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, time, multi_images, multi_poses, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
         pred_depth = outputs['depth'].reshape(-1, H, W)
@@ -166,6 +185,15 @@ class Trainer(_Trainer):
 
     # [GUI] test on a single image
     def test_gui(self, pose, intrinsics, W, H, time=0, bg_color=None, spp=1, downscale=1):
+        time_key = self.get_time_key(time)
+        multi_images_idx = self.multiview_info['image_groups'][time_key]
+        multi_poses = self.multiview_info['poses'][multi_images_idx][:, :3, :] # [Num of Multiview, 3, 4]
+        multi_images = self.multiview_info['images'][multi_images_idx] # [Num of Multiview, H, W, 4]
+        C = multi_images.shape[-1]
+        if C == 4:
+            # remove alpha channel and set rbg to 0 when alpha is 0
+            multi_images = multi_images[..., :3] * multi_images[..., 3:] + (1 - multi_images[..., 3:]) * torch.zeros_like(multi_images[..., :3])
+            multi_images = multi_images.permute(0, 3, 1, 2).contiguous() # [Num of Multiview, 3, H, W]
         
         # render resolution (may need downscale to for better frame rate)
         rH = int(H * downscale)
@@ -182,6 +210,8 @@ class Trainer(_Trainer):
             'rays_d': rays['rays_d'],
             'H': rH,
             'W': rW,
+            'multi_images': multi_images,
+            'multi_poses': multi_poses,
         }
         
         self.model.eval()
