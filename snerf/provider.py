@@ -351,6 +351,7 @@ class NeRFDataset:
             if C == 4:
                 # remove alpha channel and set rbg to 0 when alpha is 0
                 multi_images = multi_images[..., :3] * multi_images[..., 3:] + (1 - multi_images[..., 3:]) * torch.zeros_like(multi_images[..., :3])
+                multi_images = multi_images.permute(0, 3, 1, 2).contiguous() # [Num of Multiview, 3, H, W]
             results['images'] = images
             results['multi_images'] = multi_images
             results['multi_poses'] = multi_poses
